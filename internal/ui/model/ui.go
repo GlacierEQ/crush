@@ -25,6 +25,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/crush/internal/agent/hyper"
 	"github.com/charmbracelet/crush/internal/agent/notify"
 	agenttools "github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
@@ -151,6 +152,11 @@ type (
 	sessionFilesUpdatesMsg struct {
 		sessionFiles []SessionFile
 	}
+	// creditsUpdatedMsg is sent when the remaining Hyper credits have been
+	// fetched from the API.
+	creditsUpdatedMsg struct {
+		credits int
+	}
 )
 
 // UI represents the main user interface model.
@@ -253,6 +259,7 @@ type UI struct {
 
 	// pills state
 	pillsExpanded      bool
+	pillsAutoExpanded  bool
 	focusedPillSection pillSection
 	promptQueue        int
 	pillsView          string
@@ -263,6 +270,9 @@ type UI struct {
 
 	// mouse highlighting related state
 	lastClickTime time.Time
+
+	// hyperCredits is the remaining Hyper credits, updated after each prompt.
+	hyperCredits *int
 
 	// Prompt history for up/down navigation through previous messages.
 	promptHistory struct {
@@ -308,6 +318,7 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 			com.Styles.Attachments.Deleting,
 			com.Styles.Attachments.Image,
 			com.Styles.Attachments.Text,
+			com.Styles.Attachments.Skill,
 		),
 		attachments.Keymap{
 			DeleteMode: keyMap.Editor.AttachmentDeleteMode,
@@ -334,11 +345,12 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 		notifyWindowFocused: true,
 		initialSessionID:    initialSessionID,
 		continueLastSession: continueLast,
+		skillStates:         skills.GetLatestStates(),
 	}
 
 	status := NewStatus(com, ui)
 
-	ui.setEditorPrompt(false)
+	ui.setEditorPrompt(com.Workspace.PermissionSkipRequests())
 	ui.randomizePlaceholders()
 	ui.textarea.Placeholder = ui.readyPlaceholder
 	ui.status = status
@@ -385,6 +397,9 @@ func (m *UI) Init() tea.Cmd {
 	// load initial session if specified
 	if cmd := m.loadInitialSession(); cmd != nil {
 		cmds = append(cmds, cmd)
+	}
+	if m.com.IsHyper() {
+		cmds = append(cmds, m.fetchHyperCredits())
 	}
 	return tea.Batch(cmds...)
 }
@@ -455,6 +470,10 @@ func (m *UI) loadCustomCommands() tea.Cmd {
 		if err != nil {
 			slog.Error("Failed to load custom commands", "error", err)
 		}
+		// Append user-invocable skills as commands
+		skillCommands := commands.LoadSkillCommands()
+		skillCommands = append(skillCommands, commands.LoadProjectSkillCommands(m.com.Workspace.WorkingDir())...)
+		customCommands = append(customCommands, skillCommands...)
 		return userCommandsLoadedMsg{Commands: customCommands}
 	}
 }
@@ -517,6 +536,9 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		if cmd := m.setSessionMessages(msgs); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if cmd := m.autoExpandPillsIfReasonable(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 		if hasInProgressTodo(m.session.Todos) {
@@ -594,6 +616,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, m.todoSpinner.Tick)
 				m.updateLayoutAndSize()
 			}
+			m.autoExpandPillsIfReasonable()
 		}
 	case pubsub.Event[message.Message]:
 		// Check if this is a child session message for an agent tool.
@@ -854,6 +877,8 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := m.handleSelectModel(msg.action); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case creditsUpdatedMsg:
+		m.hyperCredits = &msg.credits
 	case util.InfoMsg:
 		if msg.Type == util.InfoTypeError {
 			slog.Error("Error reported", "error", msg.Msg)
@@ -1526,8 +1551,15 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		if msg.Args != nil {
 			content = substituteArgs(content, msg.Args)
 		}
+		// If this is a skill command, format it using the skill's FormatInvocation method
+		if msg.Skill != nil {
+			content = msg.Skill.FormatInvocation()
+		}
 		cmds = append(cmds, m.sendMessage(content))
 		m.dialog.CloseFrontDialog()
+	case dialog.ActionAttachSkill:
+		m.dialog.CloseFrontDialog()
+		cmds = append(cmds, m.attachSkill(msg.ID, msg.Name))
 	case dialog.ActionRunMCPPrompt:
 		if len(msg.Arguments) > 0 && msg.Args == nil {
 			m.dialog.CloseFrontDialog()
@@ -1575,12 +1607,40 @@ func (m *UI) refreshHyperAndRetrySelect(msg dialog.ActionSelectModel) tea.Cmd {
 	}
 }
 
+// fetchHyperCredits returns a command that asynchronously fetches the
+// remaining Hyper credits from the API.
+func (m *UI) fetchHyperCredits() tea.Cmd {
+	return func() tea.Msg {
+		cfg := m.com.Config()
+		if cfg == nil {
+			return nil
+		}
+		providerCfg, ok := cfg.Providers.Get(hyper.Name)
+		if !ok {
+			return nil
+		}
+		apiKey, err := m.com.Workspace.Resolver().ResolveValue(providerCfg.APIKey)
+		if err != nil || apiKey == "" {
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		credits, err := hyper.FetchCredits(ctx, apiKey)
+		if err != nil {
+			slog.Error("Failed to fetch Hyper credits", "error", err)
+			return nil
+		}
+		return creditsUpdatedMsg{credits: credits}
+	}
+}
+
 // handleSelectModel performs the model selection after any provider
 // pre-checks (such as a silent Hyper OAuth refresh) have completed.
 func (m *UI) handleSelectModel(msg dialog.ActionSelectModel) tea.Cmd {
 	var cmds []tea.Cmd
 
-	if m.isAgentBusy() {
+	// we ignore dialogs with the oauth id as they need to be able to be dismissed
+	if m.isAgentBusy() && !m.dialog.ContainsDialog(dialog.OAuthID) {
 		return util.ReportWarn("Agent is busy, please wait...")
 	}
 
@@ -1656,6 +1716,8 @@ func (m *UI) handleSelectModel(msg dialog.ActionSelectModel) tea.Cmd {
 		if err := m.com.Workspace.InitCoderAgent(context.TODO()); err != nil {
 			cmds = append(cmds, util.ReportError(err))
 		}
+	} else if m.com.IsHyper() {
+		cmds = append(cmds, m.fetchHyperCredits())
 	}
 
 	return tea.Batch(cmds...)
@@ -1742,6 +1804,16 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 				return true
 			}
 			cmds = append(cmds, tea.Suspend)
+			return true
+		case key.Matches(msg, m.keyMap.ToggleYolo):
+			yolo := !m.com.Workspace.PermissionSkipRequests()
+			m.com.Workspace.PermissionSetSkipRequests(yolo)
+			m.setEditorPrompt(yolo)
+			status := "disabled"
+			if yolo {
+				status = "enabled"
+			}
+			cmds = append(cmds, util.ReportInfo("Yolo mode "+status))
 			return true
 		}
 		return false
@@ -2066,6 +2138,7 @@ func (m *UI) drawHeader(scr uv.Screen, area uv.Rectangle) {
 		m.isCompact,
 		m.detailsOpen,
 		area.Dx(),
+		m.hyperCredits,
 	)
 }
 
@@ -2255,7 +2328,8 @@ func (m *UI) ShortHelp() []key.Binding {
 			tab.SetHelp("tab", "focus editor")
 		}
 
-		binds = append(binds,
+		binds = append(
+			binds,
 			tab,
 			commands,
 			k.Models,
@@ -2263,11 +2337,13 @@ func (m *UI) ShortHelp() []key.Binding {
 
 		switch m.focus {
 		case uiFocusEditor:
-			binds = append(binds,
+			binds = append(
+				binds,
 				k.Editor.Newline,
 			)
 		case uiFocusMain:
-			binds = append(binds,
+			binds = append(
+				binds,
 				k.Chat.UpDown,
 				k.Chat.UpDownOneItem,
 				k.Chat.PageUp,
@@ -2282,14 +2358,16 @@ func (m *UI) ShortHelp() []key.Binding {
 		// TODO: other states
 		// if m.session == nil {
 		// no session selected
-		binds = append(binds,
+		binds = append(
+			binds,
 			commands,
 			k.Models,
 			k.Editor.Newline,
 		)
 	}
 
-	binds = append(binds,
+	binds = append(
+		binds,
 		k.Quit,
 		k.Help,
 	)
@@ -2336,11 +2414,13 @@ func (m *UI) FullHelp() [][]key.Binding {
 			tab.SetHelp("tab", "focus editor")
 		}
 
-		mainBinds = append(mainBinds,
+		mainBinds = append(
+			mainBinds,
 			tab,
 			commands,
 			k.Models,
 			k.Sessions,
+			k.ToggleYolo,
 		)
 		if hasSession {
 			mainBinds = append(mainBinds, k.Chat.NewSession)
@@ -2360,7 +2440,8 @@ func (m *UI) FullHelp() [][]key.Binding {
 			}
 			binds = append(binds, editorBinds)
 			if hasAttachments {
-				binds = append(binds,
+				binds = append(
+					binds,
 					[]key.Binding{
 						k.Editor.AttachmentDeleteMode,
 						k.Editor.DeleteAllAttachments,
@@ -2369,7 +2450,8 @@ func (m *UI) FullHelp() [][]key.Binding {
 				)
 			}
 		case uiFocusMain:
-			binds = append(binds,
+			binds = append(
+				binds,
 				[]key.Binding{
 					k.Chat.UpDown,
 					k.Chat.UpDownOneItem,
@@ -2394,11 +2476,13 @@ func (m *UI) FullHelp() [][]key.Binding {
 	default:
 		if m.session == nil {
 			// no session selected
-			binds = append(binds,
+			binds = append(
+				binds,
 				[]key.Binding{
 					commands,
 					k.Models,
 					k.Sessions,
+					k.ToggleYolo,
 				},
 			)
 			editorBinds := []key.Binding{
@@ -2411,7 +2495,8 @@ func (m *UI) FullHelp() [][]key.Binding {
 			}
 			binds = append(binds, editorBinds)
 			if hasAttachments {
-				binds = append(binds,
+				binds = append(
+					binds,
 					[]key.Binding{
 						k.Editor.AttachmentDeleteMode,
 						k.Editor.DeleteAllAttachments,
@@ -2422,7 +2507,8 @@ func (m *UI) FullHelp() [][]key.Binding {
 		}
 	}
 
-	binds = append(binds,
+	binds = append(
+		binds,
 		[]key.Binding{
 			help,
 			k.Quit,
@@ -3047,10 +3133,12 @@ func (m *UI) cacheSidebarLogo(width int) {
 	m.sidebarLogo = renderLogo(m.com.Styles, true, m.com.IsHyper(), width)
 }
 
-// applyTheme replaces the active styles with the given theme and
-// refreshes every component that caches style data.
+// applyTheme replaces the active styles with the given theme, drops the
+// shared markdown renderer cache, and refreshes every component that
+// caches style data.
 func (m *UI) applyTheme(s styles.Styles) {
 	*m.com.Styles = s
+	common.InvalidateMarkdownRendererCache()
 	m.refreshStyles()
 }
 
@@ -3069,10 +3157,35 @@ func (m *UI) refreshStyles() {
 		t.Attachments.Deleting,
 		t.Attachments.Image,
 		t.Attachments.Text,
+		t.Attachments.Skill,
 	)
 	m.todoSpinner.Style = t.Pills.TodoSpinner
 	m.status.help.Styles = t.Help
 	m.chat.InvalidateRenderCaches()
+}
+
+// attachSkill reads a skill's content by ID and returns it as a markdown
+// attachment to be added to the attachment toolbar. The user can then
+// compose a message and send it with the skill attached.
+// The name parameter is used as a fallback when the server does not
+// return one.
+func (m *UI) attachSkill(skillID, name string) tea.Cmd {
+	return func() tea.Msg {
+		content, result, err := m.com.Workspace.ReadSkill(context.Background(), skillID)
+		if err != nil {
+			return util.NewErrorMsg(err)
+		}
+		fileName := result.Name
+		if fileName == "" {
+			fileName = name
+		}
+		return message.Attachment{
+			FilePath: fileName,
+			FileName: fileName,
+			MimeType: "text/markdown",
+			Content:  content,
+		}
+	}
 }
 
 // sendMessage sends a message with the given content and attachments.
@@ -3352,10 +3465,15 @@ func (m *UI) handlePermissionNotification(notification permission.PermissionNoti
 func (m *UI) handleAgentNotification(n notify.Notification) tea.Cmd {
 	switch n.Type {
 	case notify.TypeAgentFinished:
-		return m.sendNotification(notification.Notification{
+		var cmds []tea.Cmd
+		cmds = append(cmds, m.sendNotification(notification.Notification{
 			Title:   "Crush is waiting...",
 			Message: fmt.Sprintf("Agent's turn completed in \"%s\"", n.SessionTitle),
-		})
+		}))
+		if m.com.IsHyper() {
+			cmds = append(cmds, m.fetchHyperCredits())
+		}
+		return tea.Batch(cmds...)
 	case notify.TypeReAuthenticate:
 		return m.handleReAuthenticate(n.ProviderID)
 	default:
@@ -3395,6 +3513,7 @@ func (m *UI) newSession() tea.Cmd {
 	m.chat.Blur()
 	m.chat.ClearMessages()
 	m.pillsExpanded = false
+	m.pillsAutoExpanded = false
 	m.promptQueue = 0
 	m.pillsView = ""
 	m.historyReset()
@@ -3410,6 +3529,9 @@ func (m *UI) newSession() tea.Cmd {
 
 // handlePasteMsg handles a paste message.
 func (m *UI) handlePasteMsg(msg tea.PasteMsg) tea.Cmd {
+	// Normalize \r\n before the textarea sanitizer sees it.
+	msg.Content = strings.ReplaceAll(msg.Content, "\r\n", "\n")
+
 	if m.dialog.HasDialogs() {
 		return m.handleDialogMsg(msg)
 	}
